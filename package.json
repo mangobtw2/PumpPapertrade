@@ -1,0 +1,27 @@
+{
+  "name": "findertools",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@solana-program/compute-budget": "^0.6.1",
+    "@solana-program/system": "^0.6.2",
+    "@solana-program/token": "^0.4.1",
+    "@solana/web3.js": "^2.0.0",
+    "@triton-one/yellowstone-grpc": "^1.4.1",
+    "bs58": "^6.0.0",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0",
+    "redis": "^4.7.0",
+    "typescript": "^5.7.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.6"
+  }
+}

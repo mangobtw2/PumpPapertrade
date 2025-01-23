@@ -1,0 +1,5 @@
+config.ts
+node_modules/
+.log
+index.ts
+results/
