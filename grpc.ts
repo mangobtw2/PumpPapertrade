@@ -239,8 +239,16 @@ async function checkStatus(status: Status){
 // Add these functions for memory management
 export async function clearRedisMemory() {
     try {
-        await redisClient.flushAll();
-        logger.info('Redis memory cleared successfully');
+        // Get all keys matching the pattern "tradesPump:*"
+        const keys = await redisClient.keys('tradesPump:*');
+        
+        if (keys.length > 0) {
+            // Delete all matched keys
+            await redisClient.del(keys);
+            logger.info(`Redis memory cleared successfully for ${keys.length} tradesPump keys`);
+        } else {
+            logger.info('No tradesPump keys found to clear');
+        }
     } catch (error) {
         logger.error('Error clearing Redis memory:', error);
     }
