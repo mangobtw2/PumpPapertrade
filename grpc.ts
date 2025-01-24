@@ -37,7 +37,11 @@ const redisClient = createClient({
 
 //init function: needs to be awaited before running
 export async function init(clearMemory: boolean = false){
-    await redisClient.connect();
+    try{
+        await redisClient.connect();
+    }catch(error){
+        console.error("Failed to connect to Redis", error);
+    }
     
     if (clearMemory) {
         await clearRedisMemory();
@@ -97,18 +101,18 @@ export async function init(clearMemory: boolean = false){
         await init();
     }
 }
-// let lastLog = Date.now();
+let lastLog = Date.now();
 //sets up the event handlers for the gRPC stream
 function setupStreamEventHandlers(stream: ClientDuplexStream<SubscribeRequest, SubscribeUpdate>){
     stream.on("data", async (data: SubscribeUpdate) => {
 
-        // const now = Date.now();
-        // if (now - lastLog >= 1000) {
-        //     console.log({
-        //         time: data.createdAt?.toTimeString()
-        //     });
-        //     lastLog = now;
-        // }
+        const now = Date.now();
+        if (now - lastLog >= 1000) {
+            console.log({
+                time: data.createdAt?.toTimeString()
+            });
+            lastLog = now;
+        }
 
         handleTransactionUpdate(data);
     });
