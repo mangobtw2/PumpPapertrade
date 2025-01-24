@@ -233,12 +233,16 @@ async function trackBuy(trade: Trade, tokensPerLamport: number){
     }
     
     // Use Redis List to append trade data for the wallet
-    await redisClient.lPush(`tradesPump:${trade.wallet}`, JSON.stringify({
-        positionID: status.positionID,  // same ID to connect with buy
-        amount: -1,  // negative for buy
-        timestamp: Date.now(),
-        mint: status.mint
-    }));
+    try{
+        await redisClient.lPush(`tradesPump:${trade.wallet}`, JSON.stringify({
+            positionID: status.positionID,  // same ID to connect with buy
+            amount: -1,  // negative for buy
+            timestamp: Date.now(),
+            mint: status.mint
+        }));
+    }catch(error){
+        console.error("Failed to append trade data to Redis", error);
+    }
 }
 
 async function sellQuarter(status: Status){
@@ -251,12 +255,16 @@ async function sellQuarter(status: Status){
         const currentTokensPerLamport = tokenInfoMap.get(status.mint)?.tokensPerLamport;
         if(!currentTokensPerLamport) return;
         const sellAmount = status.initialTokensPerLamport / currentTokensPerLamport;
-        await redisClient.lPush(`tradesPump:${status.address}`, JSON.stringify({
-            positionID: status.positionID,  // same ID to connect with buy
-            amount: sellAmount,  // positive for sell
-            timestamp: Date.now(),
-            mint: status.mint
-        }));
+        try{
+            await redisClient.lPush(`tradesPump:${status.address}`, JSON.stringify({
+                positionID: status.positionID,  // same ID to connect with buy
+                amount: sellAmount,  // positive for sell
+                timestamp: Date.now(),
+                mint: status.mint
+            }));
+        }catch(error){
+            console.error("Failed to append trade data to Redis", error);
+        }
         return;
     };
     const currentTokensPerLamport = tokenInfoMap.get(status.mint)?.tokensPerLamport;
@@ -264,12 +272,16 @@ async function sellQuarter(status: Status){
     const sellAmount = (status.initialTokensPerLamport / currentTokensPerLamport) / 4;
     
     // Append sell trade to the wallet's trade list
-    await redisClient.lPush(`tradesPump:${status.address}`, JSON.stringify({
-        positionID: status.positionID,  // same ID to connect with buy
-        amount: sellAmount,  // positive for sell
-        timestamp: Date.now(),
-        mint: status.mint
-    }));
+    try{
+        await redisClient.lPush(`tradesPump:${status.address}`, JSON.stringify({
+            positionID: status.positionID,  // same ID to connect with buy
+            amount: sellAmount,  // positive for sell
+            timestamp: Date.now(),
+            mint: status.mint
+        }));
+    }catch(error){
+        console.error("Failed to append trade data to Redis", error);
+    }
 
     if(status.waitingForSell < 4) {
         queue.push({
