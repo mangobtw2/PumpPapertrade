@@ -10,7 +10,7 @@ import { Trade } from "./tradeTypes.js";
 import { grpcExistsMigration, grpcTransactionToTrades, tradeToPrice } from "./coreUtils.js";
 import bs58 from "bs58";
 import { fileURLToPath } from 'url';
-import fs from "fs";
+import fs, { StatsListener } from "fs";
 import { createClient } from 'redis';
 
 
@@ -134,13 +134,15 @@ function setupStreamEventHandlers(stream: ClientDuplexStream<SubscribeRequest, S
 
 let queue: Status[] = [];
 
+let waitingForMigrationMap = new Map<string, Status[]>();
+
 setInterval(() => {
     const now = Date.now();
     // Find expired items
     const expiredItems = queue.filter(item => item.waitingForTimestamp <= now);
     // Process expired items
     for (const item of expiredItems) {
-        checkStatus(item);
+        sellQuarter(item);
     }
     // Remove expired items from queue
     queue = queue.filter(item => item.waitingForTimestamp > now);
@@ -152,6 +154,7 @@ type Status = {
     address: string;
     initialTokensPerLamport: number;
     waitingForTimestamp: number; //waiting for timestamp
+    waitingForSell: number; //waiting for sell 1, 2, 3 or 4 (1 means waiting for migration) (0 for migration timeout)
 }
 
 async function handleTransactionUpdate(data: SubscribeUpdate){
@@ -167,6 +170,12 @@ async function handleTransactionUpdate(data: SubscribeUpdate){
         }else{
             existingTokenInfo.migrated = true;
         }
+        const existingMigrationList = waitingForMigrationMap.get(existsMigration.mint);
+        if(existingMigrationList){
+            for(const item of existingMigrationList){
+                sellQuarter(item);
+            }
+        }
         return;
     }
     const trades = await grpcTransactionToTrades(data.transaction);
@@ -180,7 +189,7 @@ async function handleTransactionUpdate(data: SubscribeUpdate){
                     tokensPerLamport: tokensPerLamport
                 });
             }
-            if(existingTokenInfo && !existingTokenInfo.migrated){
+            else{
                 existingTokenInfo.tokensPerLamport = tokensPerLamport;
             }
             if(trade.direction == "buy"){
@@ -195,44 +204,75 @@ function createID(){
 }
 
 async function trackBuy(trade: Trade, tokensPerLamport: number){
+    const migrationTimeoutStatus: Status = {
+        positionID: createID(),
+        mint: trade.mint,
+        address: trade.wallet,
+        initialTokensPerLamport: tokensPerLamport,
+        waitingForTimestamp: Date.now() + 1000 * 60 * 60 * 12,
+        waitingForSell: 0
+    }
+    queue.push(migrationTimeoutStatus);
     const status: Status = {
         positionID: createID(),
         mint: trade.mint,
         address: trade.wallet,
         initialTokensPerLamport: tokensPerLamport,
-        waitingForTimestamp: Date.now() + 1000 * 60 * 60 * 6
+        waitingForTimestamp: 0,
+        waitingForSell: 1
     }
-    queue.push(status);
+    const existingMigrationList = waitingForMigrationMap.get(trade.mint);
+    if(existingMigrationList){
+        existingMigrationList.push(status);
+    }else{
+        waitingForMigrationMap.set(trade.mint, [status]);
+    }
     
     // Use Redis List to append trade data for the wallet
     await redisClient.lPush(`tradesPump:${trade.wallet}`, JSON.stringify({
-        positionID: status.positionID,
-        status: "buy",
-        percentageGain: 0,
+        positionID: status.positionID,  // same ID to connect with buy
+        amount: -1,  // negative for buy
         timestamp: Date.now(),
-        mint: trade.mint
+        mint: status.mint
     }));
 }
 
-async function checkStatus(status: Status){
-    const currentTokenInfo = tokenInfoMap.get(status.mint);
-    if(!currentTokenInfo) return;
-    if(currentTokenInfo.migrated){
-        await redisClient.lPush(`tradesPump:${status.address}`, JSON.stringify({
-            positionID: status.positionID,
-            status: "migrated",
-            percentageGain: status.initialTokensPerLamport / currentTokenInfo.tokensPerLamport,
-            timestamp: Date.now(),
-            mint: status.mint
-        }));
-    }else{
+async function sellQuarter(status: Status){
+    if(status.waitingForSell == 0 && !tokenInfoMap.get(status.mint)?.migrated) {
+        //remove from waitingForMigrationMap as we timed out
+        const existingMigrationList = waitingForMigrationMap.get(status.mint);
+        if(existingMigrationList){
+            waitingForMigrationMap.set(status.mint, existingMigrationList.filter(item => item.positionID != status.positionID));
+        }
+        const currentTokensPerLamport = tokenInfoMap.get(status.mint)?.tokensPerLamport;
+        if(!currentTokensPerLamport) return;
+        const sellAmount = status.initialTokensPerLamport / currentTokensPerLamport;
         await redisClient.lPush(`tradesPump:${status.address}`, JSON.stringify({
             positionID: status.positionID,  // same ID to connect with buy
-            status: "notMigrated",
-            percentageGain: 0,
+            amount: sellAmount,  // positive for sell
             timestamp: Date.now(),
             mint: status.mint
         }));
+        return;
+    };
+    const currentTokensPerLamport = tokenInfoMap.get(status.mint)?.tokensPerLamport;
+    if(!currentTokensPerLamport) return;
+    const sellAmount = (status.initialTokensPerLamport / currentTokensPerLamport) / 4;
+    
+    // Append sell trade to the wallet's trade list
+    await redisClient.lPush(`tradesPump:${status.address}`, JSON.stringify({
+        positionID: status.positionID,  // same ID to connect with buy
+        amount: sellAmount,  // positive for sell
+        timestamp: Date.now(),
+        mint: status.mint
+    }));
+
+    if(status.waitingForSell < 4) {
+        queue.push({
+            ...status,
+            waitingForTimestamp: status.waitingForTimestamp + 1000 * 150,
+            waitingForSell: status.waitingForSell + 1
+        });
     }
 }
 
