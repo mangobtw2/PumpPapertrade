@@ -406,7 +406,7 @@ async function sellQuarter(status: Status){
         }
             queue.push({
                 ...status,
-                waitingForTimestamp: status.waitingForTimestamp + 1000 * 150,
+                waitingForTimestamp: Date.now() + 1000 * 150,
                 waitingForSell: status.waitingForSell + 1
             });
     }else{
