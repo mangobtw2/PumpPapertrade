@@ -242,7 +242,7 @@ type Status = {
     address: string;
     tokensBought: bigint;
     waitingForTimestamp: number; //waiting for timestamp
-    waitingForSell: number; //waiting for sell 1, 2, 3 or 4 (1 means waiting for migration) (0 for migration timeout)
+    waitingForSell: number; //waiting for sell 1, 2, 3 or 4 (1 means waiting for migration) (0 for migration timeout), -1 (waiting for buy)
 }
 
 async function handlePumpTransactionUpdate(data: SubscribeUpdate){
@@ -313,48 +313,60 @@ function createID(){
 }
 
 async function trackBuy(trade: Trade){
-    const bondingCurvePoolBalance = tokenInfoMap.get(trade.mint)?.bondingCurvePoolBalance;
-    if(!bondingCurvePoolBalance) return;
-    const buyAmount = pumpFunCalc.getBuyOutAmount(1000000000n, bondingCurvePoolBalance.virtualSolReserves, bondingCurvePoolBalance.virtualTokenReserves);
-    const id = createID();
-    const migrationTimeoutStatus: Status = {
-        positionID: id,
+    const buyStatus: Status = {
+        positionID: createID(),
         mint: trade.mint,
         address: trade.wallet,
-        tokensBought: buyAmount,
-        waitingForTimestamp: Date.now() + 1000 * 60 * 60 * 12,
-        waitingForSell: 0
+        tokensBought: 0n,
+        waitingForTimestamp: Date.now() + 1000 * 1.5,
+        waitingForSell: -1
     }
-    queue.push(migrationTimeoutStatus);
-    const status: Status = {
-        positionID: id,
-        mint: trade.mint,
-        address: trade.wallet,
-        tokensBought: buyAmount,
-        waitingForTimestamp: 0,
-        waitingForSell: 1
-    }
-    const existingMigrationList = waitingForMigrationMap.get(trade.mint);
-    if(existingMigrationList){
-        existingMigrationList.push(status);
-    }else{
-        waitingForMigrationMap.set(trade.mint, [status]);
-    }
-    
-    // Use Redis List to append trade data for the wallet
-    try{
-        await redisClient.lPush(`tradesPump:${trade.wallet}`, JSON.stringify({
-            positionID: status.positionID,  // same ID to connect with buy
-            amount: -1,  // negative for buy
-            timestamp: Date.now(),
-            mint: status.mint
-        }));
-    }catch(error){
-        console.error("Failed to append trade data to Redis", error);
-    }
+    queue.push(buyStatus);
 }
 
 async function sellQuarter(status: Status){
+    if(status.waitingForSell == -1){
+        const bondingCurvePoolBalance = tokenInfoMap.get(status.mint)?.bondingCurvePoolBalance;
+        if(!bondingCurvePoolBalance) return;
+        const buyAmount = pumpFunCalc.getBuyOutAmount(1000000000n, bondingCurvePoolBalance.virtualSolReserves, bondingCurvePoolBalance.virtualTokenReserves);
+        const id = createID();
+        const migrationTimeoutStatus: Status = {
+            positionID: id,
+            mint: status.mint,
+            address: status.address,
+            tokensBought: buyAmount,
+            waitingForTimestamp: Date.now() + 1000 * 60 * 60 * 12,
+            waitingForSell: 0
+        }
+        queue.push(migrationTimeoutStatus);
+        const migrationSellStatus: Status = {
+            positionID: id,
+            mint: status.mint,
+            address: status.address,
+            tokensBought: buyAmount,
+            waitingForTimestamp: 0,
+            waitingForSell: 1
+        }
+        const existingMigrationList = waitingForMigrationMap.get(status.mint);
+        if(existingMigrationList){
+            existingMigrationList.push(migrationSellStatus);
+        }else{
+            waitingForMigrationMap.set(status.mint, [migrationSellStatus]);
+        }
+        
+        // Use Redis List to append trade data for the wallet
+        try{
+            await redisClient.lPush(`tradesPump:${status.address}`, JSON.stringify({
+                positionID: status.positionID,  // same ID to connect with buy
+                amount: -1,  // negative for buy
+                timestamp: Date.now(),
+                mint: status.mint
+            }));
+        }catch(error){
+            console.error("Failed to append trade data to Redis", error);
+        }
+        return;
+    }
     if(status.waitingForSell == 0 && !tokenInfoMap.get(status.mint)?.migrated) {
         //remove from waitingForMigrationMap as we timed out
         const existingMigrationList = waitingForMigrationMap.get(status.mint);
