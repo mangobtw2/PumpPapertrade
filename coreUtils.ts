@@ -574,6 +574,177 @@ export async function grpcExistsMigration(transactionUpdate: SubscribeUpdateTran
     return;
 }
 
+type BondingCurvePoolBalance = {
+    mint: string;
+    virtualSolReserves: bigint;
+    virtualTokenReserves: bigint;
+}
+
+export async function grpcTransactionToBondingCurvePoolBalances(transactionUpdate: SubscribeUpdateTransaction): Promise<BondingCurvePoolBalance[] | undefined>{
+    const transaction = transactionUpdate.transaction;
+    if(!transaction) return undefined;
+    const signature = bs58.encode(transaction.signature);
+    const accountKeys = transaction.transaction?.message?.accountKeys.concat((transaction.meta?.loadedWritableAddresses ? transaction.meta?.loadedWritableAddresses : [])).concat((transaction.meta?.loadedReadonlyAddresses ? transaction.meta?.loadedReadonlyAddresses : []));
+    const instructions = transaction.transaction?.message?.instructions;
+    const innerInstructionGroups = transaction.meta?.innerInstructions;
+    const postTokenBalances = transaction.meta?.postTokenBalances;
+    const block = Number(transactionUpdate.slot);
+    if(!accountKeys || !instructions || !innerInstructionGroups || !postTokenBalances || !block) return undefined;
+
+    let poolBalances: BondingCurvePoolBalance[] = [];
+
+    const pumpLogCodecLength = pumpLogCodec.fixedSize;
+
+    const pumpAccountIndex = accountKeys.findIndex(accountKey => Buffer.compare(accountKey, constants.PUMP_FUN_PROGRAM_ADDRESS_BYTES) == 0);
+    if(pumpAccountIndex == -1) return undefined;
+
+    for(const innerInstructionGroup of innerInstructionGroups){
+        for(const innerInstruction of innerInstructionGroup.instructions){
+            try{
+                if(innerInstruction.programIdIndex == pumpAccountIndex && innerInstruction.data.length == pumpLogCodecLength){
+                    const decoded = pumpLogCodec.decode(innerInstruction.data);
+                    poolBalances.push({
+                        mint: address(decoded.mint),
+                        virtualSolReserves: BigInt(decoded.virtualSolReserves),
+                        virtualTokenReserves: BigInt(decoded.virtualTokenReserves)
+                    });
+                }
+            }catch(error){
+                logger.error("Error parsing pump.fun anchor log instruction", error);
+                continue;
+            }
+        }
+    }
+}
+
+
+type PoolBalance = {
+    ammId: string;
+    solPool: bigint;
+    tokenPool: bigint;
+}
+export async function grpcTransactionToPoolBalances(transactionUpdate: SubscribeUpdateTransaction): Promise<PoolBalance[] | undefined>{
+    const transaction = transactionUpdate.transaction;
+    if(!transaction) return undefined;
+    const signature = bs58.encode(transaction.signature);
+    const accountKeys = transaction.transaction?.message?.accountKeys.concat((transaction.meta?.loadedWritableAddresses ? transaction.meta?.loadedWritableAddresses : [])).concat((transaction.meta?.loadedReadonlyAddresses ? transaction.meta?.loadedReadonlyAddresses : []));
+    const instructions = transaction.transaction?.message?.instructions;
+    const innerInstructionGroups = transaction.meta?.innerInstructions;
+    const postTokenBalances = transaction.meta?.postTokenBalances;
+    const block = Number(transactionUpdate.slot);
+    if(!accountKeys || !instructions || !innerInstructionGroups || !postTokenBalances || !block) return undefined;
+
+    let poolBalances: PoolBalance[] = [];
+    //traversing over accounts and finding out whether raydium or pump.fun is involved
+    let raydiumAccountIndex = -1;
+    for(let accountIndex = 0; accountIndex < accountKeys.length; accountIndex++){
+        const accountKey = accountKeys[accountIndex];
+        if(Buffer.compare(accountKey, constants.RAYDIUM_PROGRAM_ADDRESS_BYTES) == 0){
+            raydiumAccountIndex = accountIndex;
+        }
+    }
+    if(raydiumAccountIndex == -1) return undefined;
+    //now we know that the raydium account is at raydiumAccountIndex. getting pool balances
+
+    // first traversing over instructions to find trades
+    for(let instructionIndex = 0; instructionIndex < instructions.length; instructionIndex++){
+        const instruction = instructions[instructionIndex];
+        try{
+            if(instruction.programIdIndex == raydiumAccountIndex && instruction.data[0] == 9){
+                //we now know that instruction is a raydium swap instruction
+                const ammId = accountKeys[instruction.accounts[1]];
+
+                const pool1balance = postTokenBalances.find(balance => balance.accountIndex == instruction.accounts[instruction.accounts.length == 18 ? 5 : 4]);
+                const pool2balance = postTokenBalances.find(balance => balance.accountIndex == instruction.accounts[instruction.accounts.length == 18 ? 6 : 5]);
+                if(!pool1balance || !pool2balance) continue;
+                
+                const isPool1Wsol = pool1balance.mint == String(constants.WSOL_ADDRESS);
+                const isPool2Wsol = pool2balance.mint == String(constants.WSOL_ADDRESS);
+                if(!pool1balance.uiTokenAmount || !pool2balance.uiTokenAmount) continue;
+                if(isPool1Wsol && isPool2Wsol){
+                    // both pool1 and pool2 are wsol, skip
+                    continue;
+                }
+                if(!isPool1Wsol && !isPool2Wsol){
+                    // both pool1 and pool2 are non-wsol, skip
+                    continue;
+                }
+                //check if there exists a non-wsol token in the pool1 or pool2
+                if(isPool2Wsol){
+                    // pool2 is wsol, pool1 is non-wsol
+                    poolBalances.push({
+                        ammId: bs58.encode(ammId),
+                        solPool: BigInt(pool2balance.uiTokenAmount.amount),
+                        tokenPool: BigInt(pool1balance.uiTokenAmount.amount)
+                    });
+                }
+                if(isPool1Wsol){
+                    // pool1 is wsol, pool2 is non-wsol
+                    poolBalances.push({
+                        ammId: bs58.encode(ammId),
+                        solPool: BigInt(pool1balance.uiTokenAmount.amount),
+                        tokenPool: BigInt(pool2balance.uiTokenAmount.amount)
+                    });
+                }
+                
+            }
+        }catch(error){
+            logger.error("Error parsing raydium swap instruction", error);
+            continue;
+        }
+    }
+    //now traversing over inner instructions, possibly hidden swaps
+    for(const innerInstructionGroup of innerInstructionGroups){
+        for(const innerInstruction of innerInstructionGroup.instructions){
+            try{
+                if(innerInstruction.programIdIndex == raydiumAccountIndex && innerInstruction.data[0] == 9){
+                    // we now know that this is a raydium swap instruction
+                    const ammId = accountKeys[innerInstruction.accounts[1]];
+                    
+                    const pool1balance = postTokenBalances.find(balance => balance.accountIndex == innerInstruction.accounts[innerInstruction.accounts.length == 18 ? 5 : 4]);
+                    const pool2balance = postTokenBalances.find(balance => balance.accountIndex == innerInstruction.accounts[innerInstruction.accounts.length == 18 ? 6 : 5]);
+                    if(!pool1balance || !pool2balance) continue;
+                    
+                    const isPool1Wsol = pool1balance.mint == String(constants.WSOL_ADDRESS);
+                    const isPool2Wsol = pool2balance.mint == String(constants.WSOL_ADDRESS);
+
+                    if(!pool1balance.uiTokenAmount || !pool2balance.uiTokenAmount) continue;
+                    if(isPool1Wsol && isPool2Wsol){
+                        // both pool1 and pool2 are wsol, skip
+                        continue;
+                    }
+                    if(!isPool1Wsol && !isPool2Wsol){
+                        // both pool1 and pool2 are non-wsol, skip
+                        continue;
+                    }
+                    if(isPool2Wsol){
+                        // pool2 is wsol, pool1 is non-wsol
+                        poolBalances.push({
+                            ammId: bs58.encode(ammId),
+                            solPool: BigInt(pool2balance.uiTokenAmount.amount),
+                            tokenPool: BigInt(pool1balance.uiTokenAmount.amount)
+                        });
+                    }
+                    if(isPool1Wsol){
+                        // pool1 is wsol, pool2 is non-wsol
+                        poolBalances.push({
+                            ammId: bs58.encode(ammId),
+                            solPool: BigInt(pool1balance.uiTokenAmount.amount),
+                            tokenPool: BigInt(pool2balance.uiTokenAmount.amount)
+                        });
+                    }   
+                }
+            }catch(error){
+                logger.error("Error parsing raydium swap instruction", error);
+                continue;
+            }
+        }
+    }
+
+    if(poolBalances.length == 0) return undefined;
+    return poolBalances;
+}
+
 export async function grpcTransactionToTrades(transactionUpdate: SubscribeUpdateTransaction): Promise<Trade[] | undefined> {
     const transaction = transactionUpdate.transaction;
     if(!transaction) return undefined;

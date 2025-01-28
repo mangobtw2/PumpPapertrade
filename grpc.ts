@@ -7,24 +7,42 @@ import * as config from './config.js';
 import { createLogger } from "./logger.js";
 import { Type } from "typescript";
 import { Trade } from "./tradeTypes.js";
-import { grpcExistsMigration, grpcTransactionToTrades, tradeToPrice } from "./coreUtils.js";
+import { grpcExistsMigration, grpcTransactionToBondingCurvePoolBalances, grpcTransactionToPoolBalances, grpcTransactionToTrades, tradeToPrice } from "./coreUtils.js";
 import bs58 from "bs58";
 import { fileURLToPath } from 'url';
 import fs, { StatsListener } from "fs";
 import { createClient } from 'redis';
+import * as pumpFunCalc from "./pumpFunCalc.js";
+import * as raydiumCalc from "./raydiumCalc.js";
 
 
 const logger = createLogger(fileURLToPath(import.meta.url));
 
 const client = new Client(config.grpc_url, undefined, {});
-let stream: ClientDuplexStream<SubscribeRequest, SubscribeUpdate>;
+let pumpStream: ClientDuplexStream<SubscribeRequest, SubscribeUpdate>;
+let raydiumStream: ClientDuplexStream<SubscribeRequest, SubscribeUpdate>;
+
+type BondingCurvePoolBalance = {
+    mint: string;
+    virtualSolReserves: bigint;
+    virtualTokenReserves: bigint;
+}
+
+type PoolBalance = {
+    ammId: string;
+    solPool: bigint;
+    tokenPool: bigint;
+}
 
 type TokenInfo = {
     migrated: boolean;
-    tokensPerLamport: number;
+    bondingCurvePoolBalance: BondingCurvePoolBalance | undefined;
 }
 
 let tokenInfoMap = new Map<string, TokenInfo>();
+
+let mintToAmmIdMap = new Map<string, string>();
+let poolBalancesByAmmId = new Map<string, {solPool: bigint, tokenPool: bigint}>();
 
 const redisClient = createClient({
     url: 'redis://localhost:6379',
@@ -49,21 +67,24 @@ export async function init(clearMemory: boolean = false){
     
     try{
         try{
-            stream.end();
+            pumpStream.end();
+            raydiumStream.end();
         }catch(error){
             //
         }
-        stream = await client.subscribe();
-        setupStreamEventHandlers(stream);
+        pumpStream = await client.subscribe();
+        raydiumStream = await client.subscribe();
+        setupPumpStreamEventHandlers(pumpStream);
+        setupRaydiumStreamEventHandlers(raydiumStream);
         console.log("gRPC stream initialized");
 
-        let request: SubscribeRequest = {
+        let pumpRequest: SubscribeRequest = {
             accounts: {},
             slots: {
                 slots: {}
             },
             transactions: {
-                txs: { //raydium & pump transactions
+                txs: { //pump transactions
                     vote: false,
                     accountInclude: ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"],
                     //accountInclude: [],
@@ -78,9 +99,30 @@ export async function init(clearMemory: boolean = false){
             accountsDataSlice: [],
         }
 
+        let raydiumRequest: SubscribeRequest = {
+            accounts: {},
+            slots: {
+                slots: {}
+            },
+            transactions: {
+                txs: { //pump transactions
+                    vote: false,
+                    accountInclude: ["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"],
+                    //accountInclude: [],
+                    accountExclude: [],
+                    accountRequired: []
+                }
+            },
+            transactionsStatus: {},
+            entry: {},
+            blocks: {},
+            blocksMeta: {},
+            accountsDataSlice: [],
+        }
+
         return new Promise<void>((resolve, reject) => {
             try{
-                stream.write(request, (err: any) => {
+                pumpStream.write(pumpRequest, (err: any) => {
                     if (err === null || err === undefined) {
                         console.log("gRPC stream request sent");
                         resolve();
@@ -89,6 +131,16 @@ export async function init(clearMemory: boolean = false){
                     setTimeout(() => {
                         init();
                         }, 10000);
+                    }
+                });
+            }catch(error){
+                logger.error("Error sending gRPC stream request", error);
+            }
+            try{
+                raydiumStream.write(raydiumRequest, (err: any) => {
+                    if (err === null || err === undefined){
+                        console.log("gRPC stream request sent");
+                        resolve();
                     }
                 });
             }catch(error){
@@ -103,7 +155,7 @@ export async function init(clearMemory: boolean = false){
 }
 let lastLog = Date.now();
 //sets up the event handlers for the gRPC stream
-function setupStreamEventHandlers(stream: ClientDuplexStream<SubscribeRequest, SubscribeUpdate>){
+function setupPumpStreamEventHandlers(stream: ClientDuplexStream<SubscribeRequest, SubscribeUpdate>){
     stream.on("data", async (data: SubscribeUpdate) => {
 
         const now = Date.now();
@@ -114,7 +166,7 @@ function setupStreamEventHandlers(stream: ClientDuplexStream<SubscribeRequest, S
             lastLog = now;
         }
 
-        handleTransactionUpdate(data);
+        handlePumpTransactionUpdate(data);
     });
 
     stream.on("error", (err: any) => {
@@ -136,6 +188,38 @@ function setupStreamEventHandlers(stream: ClientDuplexStream<SubscribeRequest, S
     });
 }
 
+function setupRaydiumStreamEventHandlers(stream: ClientDuplexStream<SubscribeRequest, SubscribeUpdate>){
+    stream.on("data", async (data: SubscribeUpdate) => {
+
+        const now = Date.now();
+        if (now - lastLog >= 1000) {
+            console.log({
+                time: data.createdAt?.toTimeString()
+            });
+            lastLog = now;
+        }
+
+        handleRaydiumTransactionUpdate(data);
+    });
+
+    stream.on("error", (err: any) => {
+        console.error("Error in gRPC stream", err);
+    });
+
+    stream.on("end", () => {
+        console.error("gRPC stream ended, attempting to reconnect...");
+        setTimeout(() => {
+            init();
+        }, 500);
+    });
+
+    stream.on("close", () => {
+        console.error("gRPC stream closed, attempting to reconnect...");
+        setTimeout(() => {
+            init();
+        }, 500);
+    });
+}
 let queue: Status[] = [];
 
 let waitingForMigrationMap = new Map<string, Status[]>();
@@ -156,20 +240,50 @@ type Status = {
     positionID: string;
     mint: string;
     address: string;
-    initialTokensPerLamport: number;
+    tokensBought: bigint;
     waitingForTimestamp: number; //waiting for timestamp
     waitingForSell: number; //waiting for sell 1, 2, 3 or 4 (1 means waiting for migration) (0 for migration timeout)
 }
 
-async function handleTransactionUpdate(data: SubscribeUpdate){
+async function handlePumpTransactionUpdate(data: SubscribeUpdate){
+    if(!data.transaction) return;
+    const trades = await grpcTransactionToTrades(data.transaction);
+    const bondingCurvePoolBalance = await grpcTransactionToBondingCurvePoolBalances(data.transaction);
+    if(bondingCurvePoolBalance){
+        const poolBalance = bondingCurvePoolBalance[0];
+        tokenInfoMap.set(poolBalance.mint, {
+            migrated: false,
+            bondingCurvePoolBalance: {
+                mint: poolBalance.mint,
+                virtualSolReserves: poolBalance.virtualSolReserves,
+                virtualTokenReserves: poolBalance.virtualTokenReserves
+            }
+        });
+    }
+    if(trades){
+        for(const trade of trades){
+            if(trade.direction == "buy"){
+                trackBuy(trade);
+            }
+        }
+    }
+}
+
+async function handleRaydiumTransactionUpdate(data: SubscribeUpdate){
+    //TODO: implement
     if(!data.transaction) return;
     const existsMigration = await grpcExistsMigration(data.transaction);
     if(existsMigration){
+        mintToAmmIdMap.set(existsMigration.mint, existsMigration.amm);
+        poolBalancesByAmmId.set(existsMigration.amm, {
+            solPool: 79005300000n,
+            tokenPool: 206900000000000n
+        });
         const existingTokenInfo = tokenInfoMap.get(existsMigration.mint);
         if(!existingTokenInfo){
             tokenInfoMap.set(existsMigration.mint, {
                 migrated: true,
-                tokensPerLamport: 0
+                bondingCurvePoolBalance: undefined
             });
         }else{
             existingTokenInfo.migrated = true;
@@ -181,24 +295,15 @@ async function handleTransactionUpdate(data: SubscribeUpdate){
             }
         }
         return;
-    }
-    const trades = await grpcTransactionToTrades(data.transaction);
-    if(trades){
-        for(const trade of trades){
-            const tokensPerLamport = Number(trade.tokens) / Number(trade.lamports);
-            const existingTokenInfo = tokenInfoMap.get(trade.mint);
-            if(!existingTokenInfo){
-                tokenInfoMap.set(trade.mint, {
-                    migrated: false,
-                    tokensPerLamport: tokensPerLamport
-                });
-            }
-            else{
-                existingTokenInfo.tokensPerLamport = tokensPerLamport;
-            }
-            if(trade.direction == "buy"){
-                trackBuy(trade, tokensPerLamport);
-            }
+    }else{
+        //update pool balances
+        const poolBalances = await grpcTransactionToPoolBalances(data.transaction);
+        if(poolBalances){
+            const poolBalance = poolBalances[0];
+            poolBalancesByAmmId.set(poolBalance.ammId, {
+                solPool: poolBalance.solPool,
+                tokenPool: poolBalance.tokenPool
+            });
         }
     }
 }
@@ -207,21 +312,25 @@ function createID(){
     return crypto.randomUUID();
 }
 
-async function trackBuy(trade: Trade, tokensPerLamport: number){
+async function trackBuy(trade: Trade){
+    const bondingCurvePoolBalance = tokenInfoMap.get(trade.mint)?.bondingCurvePoolBalance;
+    if(!bondingCurvePoolBalance) return;
+    const buyAmount = pumpFunCalc.getBuyOutAmount(1000000000n, bondingCurvePoolBalance.virtualSolReserves, bondingCurvePoolBalance.virtualTokenReserves);
+    const id = createID();
     const migrationTimeoutStatus: Status = {
-        positionID: createID(),
+        positionID: id,
         mint: trade.mint,
         address: trade.wallet,
-        initialTokensPerLamport: tokensPerLamport,
+        tokensBought: buyAmount,
         waitingForTimestamp: Date.now() + 1000 * 60 * 60 * 12,
         waitingForSell: 0
     }
     queue.push(migrationTimeoutStatus);
     const status: Status = {
-        positionID: createID(),
+        positionID: id,
         mint: trade.mint,
         address: trade.wallet,
-        initialTokensPerLamport: tokensPerLamport,
+        tokensBought: buyAmount,
         waitingForTimestamp: 0,
         waitingForSell: 1
     }
@@ -252,9 +361,9 @@ async function sellQuarter(status: Status){
         if(existingMigrationList){
             waitingForMigrationMap.set(status.mint, existingMigrationList.filter(item => item.positionID != status.positionID));
         }
-        const currentTokensPerLamport = tokenInfoMap.get(status.mint)?.tokensPerLamport;
-        if(!currentTokensPerLamport) return;
-        const sellAmount = status.initialTokensPerLamport / currentTokensPerLamport;
+        const currentBondingCurvePoolBalance = tokenInfoMap.get(status.mint)?.bondingCurvePoolBalance;
+        if(!currentBondingCurvePoolBalance) return;
+        const sellAmount = Number(pumpFunCalc.getSellOutAmount(status.tokensBought, currentBondingCurvePoolBalance.virtualSolReserves, currentBondingCurvePoolBalance.virtualTokenReserves)) / 10 ** 9;
         try{
             await redisClient.lPush(`tradesPump:${status.address}`, JSON.stringify({
                 positionID: status.positionID,  // same ID to connect with buy
@@ -267,28 +376,53 @@ async function sellQuarter(status: Status){
         }
         return;
     };
-    const currentTokensPerLamport = tokenInfoMap.get(status.mint)?.tokensPerLamport;
-    if(!currentTokensPerLamport) return;
-    const sellAmount = (status.initialTokensPerLamport / currentTokensPerLamport) / 4;
-    
-    // Append sell trade to the wallet's trade list
-    try{
-        await redisClient.lPush(`tradesPump:${status.address}`, JSON.stringify({
-            positionID: status.positionID,  // same ID to connect with buy
-            amount: sellAmount,  // positive for sell
-            timestamp: Date.now(),
-            mint: status.mint
-        }));
-    }catch(error){
-        console.error("Failed to append trade data to Redis", error);
-    }
+    if(status.waitingForSell == 1){
+        const currentBondingCurvePoolBalance = tokenInfoMap.get(status.mint)?.bondingCurvePoolBalance;
+        if(!currentBondingCurvePoolBalance) return;
+        const sellAmount = Number(pumpFunCalc.getSellOutAmount(status.tokensBought / 4n, currentBondingCurvePoolBalance.virtualSolReserves, currentBondingCurvePoolBalance.virtualTokenReserves)) / 10 ** 9;
+        
+        // Append sell trade to the wallet's trade list
+        try{
+            await redisClient.lPush(`tradesPump:${status.address}`, JSON.stringify({
+                positionID: status.positionID,  // same ID to connect with buy
+                amount: sellAmount,  // positive for sell
+                timestamp: Date.now(),
+                mint: status.mint
+            }));
+        }catch(error){
+            console.error("Failed to append trade data to Redis", error);
+        }
+            queue.push({
+                ...status,
+                waitingForTimestamp: status.waitingForTimestamp + 1000 * 150,
+                waitingForSell: status.waitingForSell + 1
+            });
+    }else{
+        const ammId = mintToAmmIdMap.get(status.mint);
+        if(!ammId) return;
+        const currentPoolBalance = poolBalancesByAmmId.get(ammId);
+        if(!currentPoolBalance) return;
+        const sellAmount = Number(raydiumCalc.getOutAmount(currentPoolBalance.tokenPool, currentPoolBalance.solPool, status.tokensBought / 4n)) / 10 ** 9;
+        
+        // Append sell trade to the wallet's trade list
+        try{
+            await redisClient.lPush(`tradesPump:${status.address}`, JSON.stringify({
+                positionID: status.positionID,  // same ID to connect with buy
+                amount: sellAmount,  // positive for sell
+                timestamp: Date.now(),
+                mint: status.mint
+            }));
+        }catch(error){
+            console.error("Failed to append trade data to Redis", error);
+        }
 
-    if(status.waitingForSell < 4) {
-        queue.push({
-            ...status,
-            waitingForTimestamp: status.waitingForTimestamp + 1000 * 150,
-            waitingForSell: status.waitingForSell + 1
-        });
+        if(status.waitingForSell < 4) {
+            queue.push({
+                ...status,
+                waitingForTimestamp: status.waitingForTimestamp + 1000 * 150,
+                waitingForSell: status.waitingForSell + 1
+            });
+        }
     }
 }
 
