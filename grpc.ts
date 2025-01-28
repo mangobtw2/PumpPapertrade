@@ -389,10 +389,7 @@ async function sellQuarter(status: Status){
         return;
     };
     if(status.waitingForSell == 1){
-        const currentBondingCurvePoolBalance = tokenInfoMap.get(status.mint)?.bondingCurvePoolBalance;
-        if(!currentBondingCurvePoolBalance) return;
-        const sellAmount = Number(pumpFunCalc.getSellOutAmount(status.tokensBought / 4n, currentBondingCurvePoolBalance.virtualSolReserves, currentBondingCurvePoolBalance.virtualTokenReserves)) / 10 ** 9;
-        
+        const sellAmount = Number(raydiumCalc.getOutAmount(206900000000000n, 79005359123n, status.tokensBought / 4n)) / 10 ** 9;
         // Append sell trade to the wallet's trade list
         try{
             await redisClient.lPush(`tradesPump:${status.address}`, JSON.stringify({
