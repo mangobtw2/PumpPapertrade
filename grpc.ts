@@ -246,65 +246,72 @@ type Status = {
 }
 
 async function handlePumpTransactionUpdate(data: SubscribeUpdate){
-    if(!data.transaction) return;
-    const trades = await grpcTransactionToTrades(data.transaction);
-    const bondingCurvePoolBalance = await grpcTransactionToBondingCurvePoolBalances(data.transaction);
-    if(bondingCurvePoolBalance){
-        const poolBalance = bondingCurvePoolBalance[0];
-        tokenInfoMap.set(poolBalance.mint, {
-            migrated: false,
-            bondingCurvePoolBalance: {
-                mint: poolBalance.mint,
-                virtualSolReserves: poolBalance.virtualSolReserves,
-                virtualTokenReserves: poolBalance.virtualTokenReserves
-            }
-        });
-    }
-    if(trades){
-        for(const trade of trades){
-            if(trade.direction == "buy"){
-                trackBuy(trade);
+    try{
+        if(!data.transaction) return;
+        const trades = await grpcTransactionToTrades(data.transaction);
+        const bondingCurvePoolBalance = await grpcTransactionToBondingCurvePoolBalances(data.transaction);
+        if(bondingCurvePoolBalance){
+            const poolBalance = bondingCurvePoolBalance[0];
+            tokenInfoMap.set(poolBalance.mint, {
+                migrated: false,
+                bondingCurvePoolBalance: {
+                    mint: poolBalance.mint,
+                    virtualSolReserves: poolBalance.virtualSolReserves,
+                    virtualTokenReserves: poolBalance.virtualTokenReserves
+                }
+            });
+        }
+        if(trades){
+            for(const trade of trades){
+                if(trade.direction == "buy" && trade.lamports >= 40000000n){
+                    trackBuy(trade);
+                }
             }
         }
-    }
+    }catch(e){}
+    
 }
 
 async function handleRaydiumTransactionUpdate(data: SubscribeUpdate){
     //TODO: implement
-    if(!data.transaction) return;
-    const existsMigration = await grpcExistsMigration(data.transaction);
-    if(existsMigration){
-        mintToAmmIdMap.set(existsMigration.mint, existsMigration.amm);
-        poolBalancesByAmmId.set(existsMigration.amm, {
-            solPool: 79005300000n,
-            tokenPool: 206900000000000n
-        });
-        const existingTokenInfo = tokenInfoMap.get(existsMigration.mint);
-        if(!existingTokenInfo){
-            tokenInfoMap.set(existsMigration.mint, {
-                migrated: true,
-                bondingCurvePoolBalance: undefined
+    try{
+        if(!data.transaction) return;
+        const existsMigration = await grpcExistsMigration(data.transaction);
+        if(existsMigration){
+            mintToAmmIdMap.set(existsMigration.mint, existsMigration.amm);
+            poolBalancesByAmmId.set(existsMigration.amm, {
+                solPool: 79005300000n,
+                tokenPool: 206900000000000n
             });
+            const existingTokenInfo = tokenInfoMap.get(existsMigration.mint);
+            if(!existingTokenInfo){
+                tokenInfoMap.set(existsMigration.mint, {
+                    migrated: true,
+                    bondingCurvePoolBalance: undefined
+                });
+            }else{
+                existingTokenInfo.migrated = true;
+            }
+            const existingMigrationList = waitingForMigrationMap.get(existsMigration.mint);
+            if(existingMigrationList){
+                for(const item of existingMigrationList){
+                    sellQuarter(item);
+                }
+            }
+            return;
         }else{
-            existingTokenInfo.migrated = true;
-        }
-        const existingMigrationList = waitingForMigrationMap.get(existsMigration.mint);
-        if(existingMigrationList){
-            for(const item of existingMigrationList){
-                sellQuarter(item);
+            //update pool balances
+            const poolBalances = await grpcTransactionToPoolBalances(data.transaction);
+            if(poolBalances){
+                const poolBalance = poolBalances[0];
+                poolBalancesByAmmId.set(poolBalance.ammId, {
+                    solPool: poolBalance.solPool,
+                    tokenPool: poolBalance.tokenPool
+                });
             }
         }
-        return;
-    }else{
-        //update pool balances
-        const poolBalances = await grpcTransactionToPoolBalances(data.transaction);
-        if(poolBalances){
-            const poolBalance = poolBalances[0];
-            poolBalancesByAmmId.set(poolBalance.ammId, {
-                solPool: poolBalance.solPool,
-                tokenPool: poolBalance.tokenPool
-            });
-        }
+    }catch(error){
+        console.error("Error in gRPC stream", error);
     }
 }
 
