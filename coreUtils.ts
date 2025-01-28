@@ -615,6 +615,8 @@ export async function grpcTransactionToBondingCurvePoolBalances(transactionUpdat
             }
         }
     }
+
+    return poolBalances;
 }
 
 
